@@ -25,16 +25,5 @@ class SpeakAgent:
                                       bytes_per_sample=audio.sample_width, sample_rate=audio.frame_rate)
             play_obj.wait_done()
 
-def save_audios(subject):
-    from gtts import gTTS
-    i = 0
-    while i > -1:
-        text = input('Write: ')
-
-        tts = gTTS(text=text, lang='en', tld='ca')
-
-        file_path = f"audio/{subject}/{subject}_{i}.mp3"
-        tts.save(file_path)
-        i += 1
 
 

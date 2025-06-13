@@ -9,6 +9,7 @@ import queue
 
 from agents.speak_agent import SpeakAgent
 
+# --- Funcții de vorbire (rulate în thread-uri separate) ---
 def speak_fall():
     SpeakAgent('fall')
 
@@ -26,23 +27,38 @@ FFMPEG_EXE_PATH = r'C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin\ffmpeg
 # Eveniment pentru a semnala oprirea tuturor thread-urilor
 stop_event = threading.Event()
 
+# Cozi pentru comunicarea între thread-uri
+frame_queue_ws = queue.Queue(maxsize=50) # Cadre pentru WebSocket
+frame_queue_ffmpeg = queue.Queue(maxsize=50) # Cadre pentru FFmpeg
+results_queue = queue.Queue(maxsize=100) # Rezultate de la server
 
-frame_queue_ws = queue.Queue(maxsize=50)
-frame_queue_ffmpeg = queue.Queue(maxsize=50)
-results_queue = queue.Queue(maxsize=100)
+# --- Variabile pentru controlul dinamic al sleep-ului (Globale) ---
+# Acestea vor fi modificate de thread-ul websocket_sender_thread
+initial_sleep_time = 0.1
+min_sleep_time = 0.05 # Redus pentru a permite o accelerare mai mare
+max_sleep_time = 0.6
+current_sleep_time = initial_sleep_time
+sleep_adjustment_factor = 0.05 # Ajustat pentru o adaptare mai fină
 
+# Contoare globale pentru cadre trimise și rezultate primite de WS
+sends_count = 0
+results_count = 0
 
 # --- Funcții pentru WebSocket Sender ---
 def websocket_sender_thread(ws_url, frame_q_in, results_q_out, stop_event):
     """
     Thread dedicat trimiterii cadrelor către serverul WebSocket și preluării rezultatelor.
     Preia cadrele dintr-o coadă thread-safe și pune rezultatele în altă coadă.
+    De asemenea, gestionează logica de dynamic sleep.
     """
+    global sends_count, results_count, current_sleep_time, initial_sleep_time, min_sleep_time, max_sleep_time, sleep_adjustment_factor
 
     def on_message(ws, message):
         """Callback atunci când se primește un mesaj de la serverul WebSocket."""
+        global results_count # Modificăm variabila globală results_count
         try:
             result = json.loads(message)
+            results_count += 1 # Incrementăm contorul de rezultate
             try:
                 results_q_out.put(result, timeout=0.01)
             except queue.Full:
@@ -66,25 +82,45 @@ def websocket_sender_thread(ws_url, frame_q_in, results_q_out, stop_event):
 
         def run_sender():
             """Buclă internă pentru a trimite cadrele prin WebSocket."""
+            global sends_count, results_count, current_sleep_time # Re-declarăm global aici pentru acces în bucla internă
+
             while not stop_event.is_set():
+                frame_to_send = None
                 try:
-                    frame_to_send = frame_q_in.get(timeout=0.1)
+                    # Încercăm să luăm un cadru din coadă. Timeout mic pentru a nu bloca.
+                    frame_to_send = frame_q_in.get(timeout=0.01)
                 except queue.Empty:
-                    time.sleep(0.05)
-                    continue
+                    # Dacă nu e nimic în coadă, nu trimitem, dar continuăm logica de sleep
+                    pass
 
                 if frame_to_send is not None:
                     try:
                         _, buffer = cv2.imencode('.jpg', frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
                         jpg_as_text = base64.b64encode(buffer).decode('utf-8')
                         ws.send(jpg_as_text)
+                        sends_count += 1 # Incrementăm contorul de trimiteri
                     except websocket.WebSocketConnectionClosedException:
                         print("WebSocket connection closed unexpectedly during send.")
                         break
                     except Exception as e:
                         print(f"Error sending frame via WebSocket: {e}")
+                        # Poate reîncerca, sau opri thread-ul dacă eroarea e persistentă
+                        time.sleep(1) # Pauză scurtă după eroare
+                        continue # Trece la următoarea iterație
 
-                time.sleep(0.1)
+                if sends_count > (results_count + 1):
+                    current_sleep_time = min(current_sleep_time + sleep_adjustment_factor * 2, max_sleep_time)
+                elif sends_count > (results_count + 1):
+                    current_sleep_time = min(current_sleep_time + sleep_adjustment_factor, max_sleep_time)
+                else:
+                    current_sleep_time = max(current_sleep_time - sleep_adjustment_factor, min_sleep_time)
+
+                # Afișează starea din acest thread
+                print(f'sent: {sends_count} | results: {results_count} | sleep: {current_sleep_time:.2f}')
+
+                # Așteaptă înainte de a trimite următorul cadru
+                time.sleep(current_sleep_time)
+
             print("WebSocket sender run_sender thread stopping.")
 
         threading.Thread(target=run_sender, daemon=True).start()
@@ -96,12 +132,12 @@ def websocket_sender_thread(ws_url, frame_q_in, results_q_out, stop_event):
         on_error=on_error,
         on_close=on_close
     )
-    ws.run_forever()
+    ws.run_forever() # Aceasta este o operație blocantă care menține thread-ul activ
     print("WebSocket sender thread finished run_forever.")
-    stop_event.set()
+    stop_event.set() # Asigură-te că evenimentul de stop este setat și aici
 
 
-# --- Funcții pentru FFmpeg Streamer ---
+# --- Funcții pentru FFmpeg Streamer (fără modificări majore, doar context) ---
 def read_ffmpeg_stderr(process, stop_event):
     """Citeste erorile (stderr) de la procesul FFmpeg."""
     for line in process.stderr:
@@ -176,9 +212,9 @@ def ffmpeg_streamer_thread(ivs_rtmps_url, ffmpeg_exe_path, frame_q_in, stop_even
     while not stop_event.is_set():
         frame_to_send = None
         try:
-            frame_to_send = frame_q_in.get(timeout=0.1)
+            frame_to_send = frame_q_in.get(timeout=0.01) # Redus timeout
         except queue.Empty:
-            time.sleep(0.01)
+            time.sleep(0.001) # Redus sleep
             continue
 
         if frame_to_send is not None:
@@ -198,7 +234,7 @@ def ffmpeg_streamer_thread(ivs_rtmps_url, ffmpeg_exe_path, frame_q_in, stop_even
                     print("FFmpeg process is not running or stdin is unavailable. Skipping frame write.")
                 break
 
-        time.sleep(0.001)
+        time.sleep(0.001) # Ajustat sleep
 
     print("FFmpeg streamer thread stopping.")
     if ffmpeg_process:
@@ -206,6 +242,7 @@ def ffmpeg_streamer_thread(ivs_rtmps_url, ffmpeg_exe_path, frame_q_in, stop_even
             if ffmpeg_process.stdin:
                 ffmpeg_process.stdin.close()
 
+            # Încercați să comunicați și să așteptați terminarea procesului
             stdout_data, stderr_data = ffmpeg_process.communicate(timeout=5)
             if stdout_data:
                 print(f"[FFmpeg final stdout]:\n{stdout_data.decode('utf-8')}")
@@ -235,7 +272,7 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     if fps == 0:
-        fps = 30
+        fps = 30 # Valoare implicită dacă nu poate fi determinată
     print(f"Camera resolution: {width}x{height} at {fps} FPS")
 
     # Pornește thread-ul WebSocket (transmite coada de rezultate)
@@ -245,20 +282,21 @@ def main():
     ws_thread.start()
 
     # Pornește thread-ul FFmpeg
-    # ffmpeg_thread = threading.Thread(target=ffmpeg_streamer_thread,
-    #                                  args=(
-    #                                  IVS_RTMPS_URL, FFMPEG_EXE_PATH, frame_queue_ffmpeg, stop_event, width, height,
-    #                                  fps),
-    #                                  daemon=True)
-    # ffmpeg_thread.start()
+    ffmpeg_thread = threading.Thread(target=ffmpeg_streamer_thread,
+                                     args=(
+                                     IVS_RTMPS_URL, FFMPEG_EXE_PATH, frame_queue_ffmpeg, stop_event, width, height,
+                                     fps),
+                                     daemon=True)
+    ffmpeg_thread.start()
+
 
     prev_time = time.time()
 
     # Variabile pentru a stoca cel mai recent rezultat primit
-    latest_fall_status = False
-    latest_fire_status = False
-    latest_move_status = False
-    latest_sleep_status = False
+    latest_fall_status = 0 # 0 sau 1
+    latest_fire_status = 0 # 0 sau 1
+    latest_move_status = 0 # 0 sau 1
+    latest_sleep_status = 0 # 0 sau 1
 
     try:
         while not stop_event.is_set():
@@ -267,55 +305,62 @@ def main():
                 print("Can't receive frame from camera. Exiting...")
                 break
 
-            current_time = time.time()
-            display_fps = 1 / (current_time - prev_time)
-            prev_time = current_time
+            current_time_display = time.time() # Timp pentru calculul FPS-ului de afișare
+            display_fps = 1 / (current_time_display - prev_time)
+            prev_time = current_time_display
 
-            # NOU: Încearcă să preiei rezultatele din coada de rezultate
+            # Preia toate rezultatele disponibile din coadă
             while True:
                 try:
                     result = results_queue.get_nowait()
-                    latest_fall_status = result.get("fall", latest_fall_status)
-                    latest_fire_status = result.get("fire", latest_fire_status)
-                    latest_move_status = result.get("move", latest_move_status)
-                    latest_sleep_status = result.get("sleep", latest_sleep_status)
+                    # Actualizează statusurile doar dacă valoarea este 1 (True)
+                    # Astfel, statusurile rămân TRUE până când un nou eveniment ar fi detectat
+                    # sau până la o logică de resetare pe server.
+                    latest_fall_status = result.get("fall", 0) or latest_fall_status
+                    latest_fire_status = result.get("fire", 0) or latest_fire_status
+                    latest_move_status = result.get("move", 0) or latest_move_status
+                    latest_sleep_status = result.get("sleep", 0) or latest_sleep_status
 
-                    if latest_fall_status > 0:
-                        fall_thread = threading.Thread(target=speak_fall)
-                        fall_thread.start()
+                    if result.get("fall", 0) > 0:
+                        threading.Thread(target=speak_fall, daemon=True).start()
 
-                    if latest_move_status > 0:
-                        move_thread = threading.Thread(target=speak_move)
-                        move_thread.start()
+                    if result.get("move", 0) > 0:
+                        threading.Thread(target=speak_move, daemon=True).start()
 
-                    if latest_sleep_status > 0:
-                        sleep_thread = threading.Thread(target=speak_sleep)
-                        sleep_thread.start()
+                    if result.get("sleep", 0) > 0:
+                        threading.Thread(target=speak_sleep, daemon=True).start()
 
                 except queue.Empty:
-                    break  # Nu mai sunt rezultate de preluat, ieși din bucla interioară
+                    break  # Nu mai sunt rezultate de preluat
                 except Exception as e:
                     print(f"Error processing local result: {e}")
-                    break  # Ieși din bucla interioară la eroare
+                    break
 
-            # Afișează FPS-ul și statusul de fall/fire pe ecranul local
+            # Afișează FPS-ul și statusul pe ecranul local
             cv2.putText(frame, f"FPS: {display_fps:.2f}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.putText(frame, f"Fall: {latest_fall_status}", (10, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if latest_fall_status else (0, 255, 0), 2)
             cv2.putText(frame, f"Fire: {latest_fire_status}", (10, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if latest_fire_status else (0, 255, 0), 2)
+            cv2.putText(frame, f"Move: {latest_move_status}", (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if latest_move_status else (0, 255, 0), 2)
+            cv2.putText(frame, f"Sleep: {latest_sleep_status}", (10, 190),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if latest_sleep_status else (0, 255, 0), 2)
 
-            # Pune cadrul în coada pentru WebSocket (face o copie)
+
+            # Pune cadrele în cozi pentru alte thread-uri
+            # Folosim try-except queue.Full pentru a nu bloca aplicația dacă cozile sunt pline
             try:
                 frame_queue_ws.put(frame.copy(), timeout=0.01)
             except queue.Full:
+                # print("WS Queue full, skipping frame.") # Poate fi prea mult zgomot
                 pass
 
-                # Pune cadrul în coada pentru FFmpeg (face o altă copie)
             try:
                 frame_queue_ffmpeg.put(frame.copy(), timeout=0.01)
             except queue.Full:
+                # print("FFmpeg Queue full, skipping frame.") # Poate fi prea mult zgomot
                 pass
 
             cv2.imshow('Camera Feed', frame)
@@ -326,8 +371,9 @@ def main():
         print("Main loop exiting. Signaling threads to stop...")
         stop_event.set()
 
-        ws_thread.join(timeout=10)
-        # ffmpeg_thread.join(timeout=10)
+        # Așteaptă thread-urile să se termine (cu timeout)
+        ws_thread.join(timeout=5)
+        ffmpeg_thread.join(timeout=5)
 
         cap.release()
         cv2.destroyAllWindows()
