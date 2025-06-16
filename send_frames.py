@@ -10,7 +10,7 @@ sends_count = 0
 results_count = 0
 
 def websocket_api():
-    global sends_count, results_count # Aici sunt declarate global, dar sunt și accesibile în closure
+    global sends_count, results_count 
 
     WS_URL = "ws://18.197.7.3:5001/ws"
 
@@ -23,11 +23,20 @@ def websocket_api():
         try:
             result = json.loads(message)
             results_count += 1
-            print("fall:", result["fall"],
-                  "| fire:", result["fire"])
             
+            reminders = result['reminders']
+            if len(reminders) > 0:
+                for reminder in reminders:
+                        SpeakAgent('~'+reminder)
+
             if result['fall'] == 1:
                 SpeakAgent('fall')
+
+            if result['sleep'] == 1:
+                SpeakAgent('sleep')
+
+            if result['move'] == 1:
+                SpeakAgent('move')
 
         except Exception as e:
             print("Error parsing message:", e)
@@ -40,10 +49,7 @@ def websocket_api():
 
     def on_open(ws):
         def run():
-            # Aici trebuie să specifici că vrei să modifici variabilele globale
             global sends_count, results_count, current_sleep_time, initial_sleep_time, min_sleep_time, max_sleep_time, sleep_adjustment_factor
-            # Acum, current_sleep_time este recunoscută ca variabilă globală
-            # și se va referi la cea definită la începutul scriptului.
 
             while not stop_event.is_set():
                 with lock:
@@ -66,14 +72,14 @@ def websocket_api():
                 else:
                     current_sleep_time = max(current_sleep_time - sleep_adjustment_factor, min_sleep_time)
 
-                # print(f'sent: {sends_count} | results: {results_count} | sleep: {current_sleep_time:.2f}')
+                
 
                 time.sleep(current_sleep_time)
 
 
         threading.Thread(target=run).start()
 
-    cap = cv2.VideoCapture(8)
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Cannot open camera")
         exit()
@@ -89,7 +95,7 @@ def websocket_api():
     ws_thread = threading.Thread(target=ws.run_forever)
     ws_thread.start()
 
-    # FPS calculation
+    
     prev_time = time.time()
 
     try:
@@ -99,12 +105,12 @@ def websocket_api():
                 print("Can't receive frame. Exiting...")
                 break
 
-            # Calculate FPS
+            
             current_time_cap = time.time()
             fps = 1 / (current_time_cap - prev_time)
             prev_time = current_time_cap
 
-            # Draw FPS on the frame
+            
             cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
@@ -121,7 +127,7 @@ def websocket_api():
         cv2.destroyAllWindows()
         ws.close()
 
-# Mutăm aceste variabile la nivel de modul pentru a le putea declara global în 'run'
+
 initial_sleep_time = 0.1
 min_sleep_time = 0.1
 max_sleep_time = 1
